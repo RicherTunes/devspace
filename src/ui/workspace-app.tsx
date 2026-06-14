@@ -449,12 +449,20 @@ function SummaryBadges({ card }: { card: ToolResultCard }) {
   if (card.tool === "open_workspace") {
     const agentsFiles = summaryNumber(summary, "agentsFiles") ?? 0;
     const skills = summaryNumber(summary, "skills") ?? 0;
-    const agentsLabel = agentsFiles > 0 ? "AGENTS.md loaded" : "No AGENTS.md";
-    return <span className="badge">{agentsLabel} · {skills} skills</span>;
+
+    return (
+      <span className="badge-group" aria-label="Workspace summary">
+        <span className={`badge ${agentsFiles > 0 ? "success" : "muted"}`}>
+          {agentsFiles > 0 ? <CheckCircleIcon /> : null}
+          {agentsFiles > 0 ? "AGENTS.md" : "No AGENTS.md"}
+        </span>
+        <span className="badge">{skills} skills</span>
+      </span>
+    );
   }
 
   if (isShellTool(card.tool)) {
-    return <span className="badge">{String(summary.lines ?? 0)} lines</span>;
+    return <span className="badge">ran · {String(summary.lines ?? 0)} lines</span>;
   }
 
   if (isSearchTool(card.tool)) {
@@ -647,6 +655,24 @@ function TerminalIcon() {
       <path d="m5 7 5 5-5 5" />
       <path d="M12 17h7" />
     </IconSvg>
+  );
+}
+
+function CheckCircleIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      className="badge-icon"
+      fill="none"
+      viewBox="0 0 16 16"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="2"
+    >
+      <circle cx="8" cy="8" r="6" />
+      <path d="m5.5 8 1.7 1.7 3.4-3.5" />
+    </svg>
   );
 }
 
