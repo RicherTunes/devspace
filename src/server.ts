@@ -1594,7 +1594,62 @@ export function createServer(config = loadConfig()): RunningServer {
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
   });
-  const transports = new Map<string, Transport>();
+  interface McpSession {
+    transport: Transport;
+    server: ReturnType<typeof createMcpServer>;
+    lastActivity: number;
+    inFlight: number;
+  }
+  const transports = new Map<string, McpSession>();
+  // Evict idle/abandoned MCP sessions so orphaned transports + their per-session
+  // McpServer instances can't accumulate and OOM the process. Clients like ChatGPT
+  // open a new session per turn and rarely send a close, so transport.onclose alone
+  // never fires for them. Tunables via env for multi-user load without a rebuild.
+  const SESSION_IDLE_MS = Number(process.env.DEVSPACE_SESSION_IDLE_MS) || 30 * 60 * 1000;
+  const SESSION_MAX = Number(process.env.DEVSPACE_SESSION_MAX) || 512;
+  // Hard ceiling for a single in-flight request. In-flight sessions are immune to
+  // idle/LRU eviction (so long builds/streams aren't killed mid-flight), but a request
+  // that shows no progress for this long is presumed dead (half-open stream, proxy/NAT/
+  // tunnel drop that never surfaced as a socket close) and reclaimed, so a stuck session
+  // can't pin the slot forever and defeat SESSION_MAX.
+  const SESSION_STUCK_MS = Number(process.env.DEVSPACE_SESSION_STUCK_MS) || 2 * 60 * 60 * 1000;
+  const disposeSession = (id: string | undefined, reason: string): void => {
+    if (!id) return;
+    const session = transports.get(id);
+    if (!session) return; // idempotent: re-entry via transport.onclose is a no-op
+    transports.delete(id);
+    logEvent(config.logging, "info", "mcp_session_closed", {
+      sessionIdPrefix: sessionIdPrefix(id),
+      reason,
+    });
+    // close() may throw synchronously or reject asynchronously; swallow both so a
+    // failing teardown can never crash the process via an unhandled rejection.
+    void Promise.resolve().then(() => session.server.close()).catch(() => {});
+    void Promise.resolve().then(() => session.transport.close()).catch(() => {});
+  };
+  const sessionReaper = setInterval(() => {
+    const now = Date.now();
+    for (const [id, session] of transports) {
+      const idle = now - session.lastActivity;
+      if (session.inFlight === 0) {
+        if (idle > SESSION_IDLE_MS) disposeSession(id, "idle_timeout");
+      } else if (idle > SESSION_STUCK_MS) {
+        // in-flight but silent for hours => presume a dead/half-open request and reclaim,
+        // so a stuck stream can't pin the session forever and defeat the cap.
+        disposeSession(id, "stuck_request");
+      }
+    }
+    if (transports.size > SESSION_MAX) {
+      const byOldest = [...transports.entries()].sort(
+        (a, b) => a[1].lastActivity - b[1].lastActivity,
+      );
+      for (const [id, session] of byOldest) {
+        if (transports.size <= SESSION_MAX) break;
+        if (session.inFlight === 0) disposeSession(id, "max_sessions");
+      }
+    }
+  }, 60 * 1000);
+  sessionReaper.unref?.();
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
@@ -1703,18 +1758,37 @@ export function createServer(config = loadConfig()): RunningServer {
 
     try {
       let transport: Transport | undefined;
+      let activeSession: McpSession | undefined;
 
       if (sessionId) {
-        transport = transports.get(sessionId);
-        if (!transport) {
+        const existing = transports.get(sessionId);
+        if (!existing) {
           sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
           return;
         }
+        existing.lastActivity = Date.now();
+        existing.inFlight++;
+        activeSession = existing;
+        transport = existing.transport;
       } else if (initializeRequest) {
+        const server = createMcpServer(
+          config,
+          workspaces,
+          reviewCheckpoints,
+          processSessions,
+          localAgentProviders,
+        );
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
-            if (transport) transports.set(newSessionId, transport);
+            if (transport) {
+              transports.set(newSessionId, {
+                transport,
+                server,
+                lastActivity: Date.now(),
+                inFlight: 0,
+              });
+            }
             logEvent(config.logging, "info", "mcp_session_created", {
               requestId,
               sessionIdPrefix: sessionIdPrefix(newSessionId),
@@ -1723,30 +1797,22 @@ export function createServer(config = loadConfig()): RunningServer {
           },
         });
 
-        transport.onclose = () => {
-          const closedSessionId = transport?.sessionId;
-          if (closedSessionId) {
-            transports.delete(closedSessionId);
-            logEvent(config.logging, "info", "mcp_session_closed", {
-              sessionIdPrefix: sessionIdPrefix(closedSessionId),
-            });
-          }
-        };
+        transport.onclose = () => disposeSession(transport?.sessionId, "client_closed");
 
-        const server = createMcpServer(
-          config,
-          workspaces,
-          reviewCheckpoints,
-          processSessions,
-          localAgentProviders,
-        );
         await server.connect(transport);
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");
         return;
       }
 
-      await transport.handleRequest(req, res, req.body);
+      try {
+        await transport.handleRequest(req, res, req.body);
+      } finally {
+        if (activeSession) {
+          activeSession.inFlight = Math.max(0, activeSession.inFlight - 1);
+          activeSession.lastActivity = Date.now();
+        }
+      }
     } catch (error) {
       logEvent(config.logging, "error", "mcp_request_error", {
         requestId,
@@ -1766,6 +1832,8 @@ export function createServer(config = loadConfig()): RunningServer {
     close: () => {
       if (closed) return;
       closed = true;
+      clearInterval(sessionReaper);
+      for (const id of [...transports.keys()]) disposeSession(id, "server_shutdown");
       processSessions.shutdown();
       oauthProvider.close();
       workspaceStore.close?.();
