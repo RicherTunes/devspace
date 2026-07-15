@@ -518,6 +518,9 @@ function spawnAgentWorker(agentId: string, promptFile: string): void {
     detached: true,
     stdio: "ignore",
     env: process.env,
+    // On Windows `detached: true` gives the child its own console, which pops a visible
+    // window for every agent worker. Every other spawn in this codebase sets windowsHide.
+    windowsHide: true,
   });
   child.unref();
 }

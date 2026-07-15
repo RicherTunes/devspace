@@ -120,6 +120,9 @@ function resolveExecutable(command: string): string | undefined {
   ], {
     encoding: "utf8",
     shell: process.platform !== "win32",
+    // without this, resolving an executable flashes a where.exe console on Windows
+    // (matches local-agent-availability.ts, which already sets it)
+    windowsHide: true,
   });
   const executable = result.stdout?.split(/\r?\n/).find((line) => line.trim());
   return executable?.trim() || undefined;
